@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 從別的目錄啟動也找得到旁邊的模組
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 
 
 def main():

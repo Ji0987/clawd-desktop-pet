@@ -15,6 +15,8 @@ STATE_FILE = BASE / 'state.json'
 REQ_DIR = BASE / 'requests'
 RESP_DIR = BASE / 'responses'
 MUTEX_NAME = 'Local\\ClawdDesktopPet'
+CLAUDE_STORE_FAMILY = 'Claude_pzs8sxrjxfjjc'          # Microsoft Store 版 Claude 的套件名稱
+CLAUDE_STORE_APP = 'shell:AppsFolder\\%s!Claude' % CLAUDE_STORE_FAMILY
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -52,11 +54,27 @@ def claude_is_foreground():
 
 
 def focus_claude():
+    """把 Claude 視窗叫到前面；視窗關掉了（沒在執行或縮到系統匣）就啟動 Claude，它會自己叫出原本的視窗。
+    沒裝 Claude 桌面版時回傳 False。"""
     hwnd = find_claude_window(include_minimized=True)
     if hwnd:
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)                   # SW_RESTORE
         user32.SetForegroundWindow(hwnd)
+        return True
+    local = Path(os.environ.get('LOCALAPPDATA', ''))
+    exe = local / 'AnthropicClaude' / 'claude.exe'      # 舊版安裝程式裝的
+    if exe.is_file():
+        target = str(exe)
+    elif (local / 'Packages' / CLAUDE_STORE_FAMILY).is_dir():    # Store 版會有自己的資料夾
+        target = CLAUDE_STORE_APP
+    else:
+        return False
+    try:
+        os.startfile(target)
+    except OSError:
+        return False
+    return True
 
 
 def pet_running():

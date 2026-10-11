@@ -10,6 +10,8 @@ import tkinter.font as tkfont
 import winreg
 
 user32 = ctypes.windll.user32
+user32.MonitorFromPoint.restype = wt.HMONITOR
+user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
 user32.GetParent.restype = wt.HWND
 dwmapi = ctypes.windll.dwmapi
 PERSONALIZE = r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
@@ -52,9 +54,16 @@ def round_rect(cv, x0, y0, x1, y1, r, **kw):
     return cv.create_polygon(pts, smooth=True, **kw)
 
 
-def work_area():
-    r = wt.RECT()
-    user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [('cbSize', wt.DWORD), ('rcMonitor', wt.RECT), ('rcWork', wt.RECT), ('dwFlags', wt.DWORD)]
+
+
+def work_area(x, y):
+    """(x, y) 所在螢幕（或最近的螢幕）的工作區，多螢幕時選單和卡片才不會被推回主螢幕。"""
+    hmon = user32.MonitorFromPoint(wt.POINT(int(x), int(y)), 2)   # MONITOR_DEFAULTTONEAREST
+    mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+    r = mi.rcWork
     return r.left, r.top, r.right, r.bottom
 
 
@@ -131,7 +140,7 @@ class Popup:
         dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(ctypes.c_uint(colorref(self.t['border']))), 4)
 
     def move(self, x, y):
-        wa = work_area()
+        wa = work_area(x + self.w / 2, y + self.h / 2)
         m = round(8 * self.S)
         x = min(max(round(x), wa[0] + m), wa[2] - self.w - m)
         y = min(max(round(y), wa[1] + m), wa[3] - self.h - m)
@@ -167,7 +176,7 @@ class FluentMenu(Popup):
             self.cv.create_text(pad + 44 * S, cy + row / 2, text=label, font=self.f_body, fill=t['text'], anchor='w')
             cy += row
         h = cy + pad
-        wa = work_area()
+        wa = work_area(x, y)
         if y + h > wa[3]:                               # 像系統選單一樣，下方放不下就往上開
             y -= h
         self.show(w, h, x, y)

@@ -9,6 +9,7 @@ Claude 要你批准權限或回答問題時，Clawd 頭上會出現卡片，直�
 import ctypes
 import ctypes.wintypes as wt
 import math
+import os
 import random
 import sys
 import time
@@ -16,6 +17,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 import clawd_ipc as ipc
+import clawd_screen as screen
 import clawd_setup
 from fluent_ui import FluentMenu, RequestCard
 
@@ -24,17 +26,19 @@ CONFIG_FILE = ipc.BASE / 'config.json'      # 桌寵自己的設定（例如問�
 KEY = '#FF00FE'                       # 透明色鍵：這個顏色的像素會變透明且點擊穿透
 CLAY, INK, CREAM = '#D97757', '#1F1D1A', '#FFF8EC'
 SIDE, LAPTOP = '#B5634A', '#8E8E8E'          # 側面的深色身體、筆電
+BIKE, TIRE, STAR = '#3E7CB1', '#5A5A5A', '#F2C14E'   # 腳踏車車架、輪胎（中灰，深淺桌布都看得到）、頭暈的星星
 STALE = 600                           # 狀態檔超過這麼多秒沒更新就當作閒置
 SLEEP_AFTER = 120                     # 閒置這麼多秒後睡覺
+SLEEP_AFTER_NIGHT = 40                # 晚上 10 點到早上 6 點比較愛睡
 
 # ───────── 吉祥物造型（與 stickers/*/index.html 同一套像素定義） ─────────
 ROWS = 7                              # 身體 12 欄 × 7 列，第 0–4 列身體、5–6 列四隻腳
-ARMS = {                              # 右手座標，左手鏡射
+ARMS = {                              # 右手座標，左手鏡射；舉手時先往外伸再往上彎，格子邊靠邊才不會像斷掉
     'nub': [(11, 3)],
     'out': [(11, 3), (12, 3)],
-    'up': [(11, 3), (12, 2), (12, 1)],
-    'high': [(11, 3), (12, 2), (12, 1), (12, 0), (12, -1)],
-    'high2': [(11, 3), (12, 2), (12, 1), (13, 0), (13, -1)],
+    'up': [(11, 3), (12, 3), (12, 2), (12, 1)],
+    'high': [(11, 3), (12, 3), (12, 2), (12, 1), (12, 0), (12, -1)],
+    'high2': [(11, 3), (12, 3), (12, 2), (12, 1), (13, 1), (13, 0), (13, -1)],
 }
 
 user32 = ctypes.windll.user32
@@ -79,21 +83,9 @@ def set_dpi_aware():
         return 1.0
 
 
-def work_area():
-    r = wt.RECT()
-    user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA（主螢幕）
-    return r.left, r.top, r.right, r.bottom
-
-
-def claude_window_rect():
-    """回傳 Claude 桌面版視窗的可見外框 (left, top, right, bottom)，找不到或最小化時回傳 None。"""
-    hwnd = ipc.find_claude_window()
-    if not hwnd:
-        return None
-    r = wt.RECT()
-    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
-        user32.GetWindowRect(hwnd, ctypes.byref(r))     # 9 = DWMWA_EXTENDED_FRAME_BOUNDS
-    return r.left, r.top, r.right, r.bottom
+def is_night(now):
+    hour = time.localtime(now).tm_hour
+    return hour >= 22 or hour < 6
 
 
 def short_tool(name):
@@ -106,9 +98,10 @@ class Pet:
     def __init__(self, scale):
         self.S = scale
         self.c = max(3, round(6 * scale))                  # 一個像素格的實際邊長
-        self.W, self.H = round(200 * scale), round(8 * self.c + 48 * scale)
+        self.W, self.H = round(200 * scale), round(11.2 * self.c + 48 * scale)   # 多留 3.2 格：騎車時身體抬高，泡泡才放得下
         self.G = 0.9 * scale                               # 每格重力加速度
 
+        prev_fg = user32.GetForegroundWindow()
         self.root = tk.Tk()
         self.root.report_callback_exception = log_exception
         self.root.overrideredirect(True)
@@ -125,10 +118,13 @@ class Pet:
         self.cv.bind('<ButtonRelease-1>', self.on_release)
         self.cv.bind('<Button-3>', self.open_menu)
 
-        wa = work_area()
+        wa = screen.area_at(1, 1)[2]                       # 從主螢幕開始
         self.x, self.y = random.uniform(wa[0] + 200, wa[2] - 200), wa[3]
         self.vx = self.vy = 0.0
-        self.surface = 'floor'                             # 'floor'｜'perch'（Claude 視窗上緣）｜None 在空中
+        self.surface = 'floor'                             # 'floor'｜'perch'（站在某個視窗上緣）｜None 在空中
+        self.ledge = None                                  # 站著的那個視窗（surface 是 'perch' 時）
+        self.climb = None                                  # 走到 goal 之後要跳上去的視窗
+        self.left_ledge = None                             # 剛跳離的視窗，這次落下時不算
         self.facing = 1
         self.goal = None
         self.walking = False
@@ -160,11 +156,27 @@ class Pet:
         self.next_poll = self.next_win = 0.0
         self.last_geo = None
         self.type_start = None                             # 開始敲筆電的時間，用來播拿出筆電的開場
+        self.riding = self.want_ride = False               # 騎腳踏車中／下次出門要騎車
+        self.chute = False                                 # 從高處掉下來時打開的降落傘
+        self.dizzy_until = 0.0                             # 被甩去撞到之後頭暈到這個時間
+        self.claude_hwnd = None
+        self.cursor = self.last_cursor = (0, 0)
+        self.chase_until, self.next_chase = 0.0, time.time() + 10   # 追游標
+        self.hiding = False                                # 有全螢幕程式時縮到角落
+        self.cur_mode = 'idle'
+        self.next_top = 0.0
 
         self.root.update_idletasks()
         self.hwnd = user32.GetParent(self.root.winfo_id())
         ex = user32.GetWindowLongW(self.hwnd, -20)        # 不搶焦點、不出現在工作列
         user32.SetWindowLongW(self.hwnd, -20, ex | 0x08000000 | 0x00000080)
+        # Tk 啟動時會把自己設成前景（就算視窗藏著也一樣），你正在打字的視窗會失去焦點：馬上還回去
+        self.root.update()
+        fg = user32.GetForegroundWindow()
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        if prev_fg and pid.value == os.getpid():
+            user32.SetForegroundWindow(prev_fg)
         self.check_link()
 
     # ───────── 狀態來源 ─────────
@@ -200,22 +212,48 @@ class Pet:
         if m == 'done' and now > self.done_until:
             m = 'idle'
         if m == 'idle':
-            if not self.sleeping and now - self.last_activity > SLEEP_AFTER:
+            night = is_night(now)
+            if not self.sleeping and now - self.last_activity > (SLEEP_AFTER_NIGHT if night else SLEEP_AFTER):
                 self.sleeping = True
+                if night:
+                    self.react_until, self.react_text = now + 2, '呵～好睏'
             if self.sleeping or self.forced_sleep:
                 m = 'sleep'
         return m
 
-    def perch(self, now):
-        """Claude 視窗上緣可站立的範圍 (left, right, top)；視窗最大化或找不到時回傳 None。"""
+    # ───────── 可以站的地方 ─────────
+    def bounds(self):
+        """跟 Clawd 同一排的螢幕合起來的左右邊界（扣掉半個身體）。"""
+        lo, hi = screen.span(self.y - 1)
+        return lo + 7 * self.c, hi - 7 * self.c
+
+    def ledges(self):
+        """可以站上去的視窗上緣，換算成能站的範圍 [(hwnd, 左, 右, 上緣)]。"""
+        return [(h, l + 5 * self.c, r - 5 * self.c, top) for h, l, r, top in screen.ledges(16 * self.c, 9 * self.c)]
+
+    def find_ledge(self, hwnd):
+        return next((lg for lg in self.ledges() if lg[0] == hwnd), None) if hwnd else None
+
+    def claude_ledge(self, now):
+        """Claude 視窗上緣 (hwnd, 左, 右, 上緣)；最大化、太窄、被別的視窗蓋住或找不到時回傳 None。"""
         if now >= self.next_win:
             self.next_win = now + 0.3
-            self.claude_rect = claude_window_rect()
-        r = self.claude_rect
-        wa = work_area()
-        if not r or r[1] - 9 * self.c < wa[1] or r[2] - r[0] < 24 * self.c or r[0] > wa[2] or r[2] < wa[0]:
+            self.claude_hwnd = ipc.find_claude_window()
+            self.claude_rect = screen.window_rect(self.claude_hwnd) if self.claude_hwnd else None
+        lg = self.find_ledge(self.claude_hwnd)
+        if not lg or lg[2] - lg[1] < 14 * self.c or not screen.edge_visible(lg[0], self.ledge_spot(lg), lg[3]):
             return None
-        return r[0] + 5 * self.c, r[2] - 5 * self.c, r[1]
+        return lg
+
+    @staticmethod
+    def ledge_spot(lg):
+        return lg[1] + (lg[2] - lg[1]) * 0.25
+
+    def landing(self, prev):
+        """這一格往下掉時穿過的視窗上緣裡最高的那個。"""
+        hits = [lg for lg in self.ledges() if lg[1] <= self.x <= lg[2] and prev <= lg[3] <= self.y
+                and lg[0] != self.left_ledge and screen.edge_visible(lg[0], self.x, lg[3])]
+        return min(hits, key=lambda lg: lg[3]) if hits else None
 
     # ───────── 互動 ─────────
     def on_press(self, e):
@@ -229,7 +267,9 @@ class Pet:
         px, py, x0, y0 = self.drag
         if not self.dragging and abs(e.x_root - px) + abs(e.y_root - py) > 4:
             self.dragging = True
-            self.surface, self.goal = None, None
+            self.surface, self.goal, self.ledge, self.climb, self.left_ledge = None, None, None, None, None
+            self.riding = self.chute = False
+            self.chase_until = 0.0
         if self.dragging:
             now = time.time()
             self.drag_hist = [p for p in self.drag_hist if now - p[0] < 0.25] + [(now, e.x_root, e.y_root)]
@@ -256,7 +296,11 @@ class Pet:
                 self.facing = 1 if self.vx > 0 else -1
         else:
             self.wake(now)
-            self.react_until, self.react_text = now + 1.5, random.choice(['嗨！', '摸摸', '嘿嘿', '♪'])
+            text = random.choice(['嗨！', '摸摸', '嘿嘿', '♪'])
+            if self.cur_mode in ('done', 'alert') and not self.card and ipc.find_claude_window(True):
+                ipc.focus_claude()                         # 說完成或在等你的時候，點牠就回 Claude（桌面版開著時）
+                text = '去看看！'
+            self.react_until, self.react_text = now + 1.5, text
             self.hop(10)
         self.drag = None
 
@@ -270,12 +314,22 @@ class Pet:
         else:
             self.forced_sleep = True
 
+    def open_claude(self):
+        if not ipc.focus_claude():
+            self.react_until, self.react_text = time.time() + 2.5, '找不到 Claude 桌面版'
+
+    def go_ride(self):
+        """下次出門騎腳踏車；在 Claude 視窗上的話會先走下來。"""
+        self.wake(time.time())
+        self.want_ride, self.goal, self.next_wander = True, None, 0.0
+
     def open_menu(self, e):
         if self.menu:
             self.menu.close()
         asleep = self.sleeping or self.forced_sleep
         items = [('' if asleep else '', '起床' if asleep else '睡覺', self.toggle_sleep),
-                 ('', '開啟 Claude', ipc.focus_claude)]
+                 ('', '騎腳踏車兜風', self.go_ride),
+                 ('', '開啟 Claude', self.open_claude)]
         linked = clawd_setup.status() == 'on'
         items.append(('', '解除 Claude Code 連動' if linked else '連動 Claude Code',
                       lambda: self.set_link(not linked)))
@@ -359,7 +413,7 @@ class Pet:
 
     def hop(self, power):
         if self.surface is not None:
-            self.surface = None
+            self.surface, self.riding = None, False
             self.vy = -power * self.S
 
     # ───────── 行為 ─────────
@@ -367,91 +421,189 @@ class Pet:
         self.walking = False
         if self.dragging or self.surface is None:
             return
-        if self.card:                                      # 等你回答時原地站好，卡片才不會跟著跑
-            self.goal = None
+        if self.card or now < self.dizzy_until:            # 等你回答時原地站好，卡片才不會跟著跑；頭暈時也站著不動
+            self.goal, self.riding, self.climb = None, False, None
             return
-        perch = self.perch(now)
+        lo, hi = self.bounds()
         speed = 1.6 * self.S
         if mode in ('thinking', 'working', 'alert'):
+            self.chase_until = 0.0
             speed = 4.5 * self.S
-            if perch:
-                gx = perch[0] + (perch[1] - perch[0]) * 0.25
-                if self.surface == 'floor' and abs(self.x - gx) < 8 * self.S:
-                    h = self.y - perch[2] + 18 * self.S        # 跳上 Claude 視窗
-                    self.surface, self.vx = None, 0.0
-                    self.vy = -math.sqrt(2 * self.G * max(h, 10))
-                    return
-                self.goal = gx
-            elif self.claude_rect:
-                wa = work_area()
-                gx = min(max((self.claude_rect[0] + self.claude_rect[2]) / 2, wa[0] + 80), wa[2] - 80)
-                self.goal = gx if abs(self.x - gx) > 4 else None
+            claude = self.claude_ledge(now)
+            if claude:                                     # 去 Claude 視窗上緣陪著
+                self.goal = self.ledge_spot(claude)
+                self.climb = None if self.ledge == claude[0] else claude[0]
+            elif self.claude_rect:                         # 站不上去（最大化之類）就待在視窗正下方
+                gx = min(max((self.claude_rect[0] + self.claude_rect[2]) / 2, lo), hi)
+                self.goal, self.climb = (gx if abs(self.x - gx) > 4 else None), None
             else:
-                self.goal = None
+                self.goal = self.climb = None
             if mode == 'alert' and self.goal is None and now > self.next_hop:
                 self.next_hop = now + 1.0
                 self.hop(8)
         elif mode == 'done':
-            self.goal = None
+            self.goal = self.climb = None
             if now > self.next_hop:
                 self.next_hop = now + 0.7
                 self.hop(9)
         elif mode == 'sleep':
-            self.goal = None
-        else:                                              # 閒晃：隨機挑地點走過去，偶爾走下視窗邊
-            if self.goal is None and now > self.next_wander:
-                wa = work_area()
-                self.goal = random.uniform(wa[0] + 60 * self.S, wa[2] - 60 * self.S)
-                if self.surface == 'perch' and perch and random.random() < 0.6:
-                    self.goal = random.uniform(perch[0], perch[1])
+            self.goal = self.climb = None
+        elif not self.chase(now, lo, hi) and self.goal is None and now > self.next_wander:
+            self.wander(lo, hi)
+        if self.climb and self.goal is not None and abs(self.x - self.goal) < 8 * self.S:
+            target = self.find_ledge(self.climb)
+            self.climb = None
+            if target and target[1] <= self.x <= target[2]:
+                self.jump_to(target)
+                return
         if self.goal is not None:
+            step = speed
+            if self.riding:
+                step = max(speed, 4.2 * self.S)
+            elif now < self.chase_until:
+                step = 3.8 * self.S
             dx = self.goal - self.x
-            if abs(dx) <= speed:
+            if abs(dx) <= step:
                 self.x, self.goal = self.goal, None
                 self.next_wander = now + random.uniform(2, 7)
             else:
                 self.facing = 1 if dx > 0 else -1
-                self.x += self.facing * speed
+                self.x += self.facing * step
                 self.walking = True
+        if self.goal is None:                              # 到了就下車
+            self.riding = False
+
+    def wander(self, lo, hi):
+        """閒晃時挑下一個目的地：在原本的視窗上走走、走下來、騎車去遠方，或跳上附近的視窗。"""
+        self.goal = random.uniform(lo, hi)
+        if self.surface == 'perch':
+            cur = self.find_ledge(self.ledge)
+            if cur and random.random() < 0.6 and not self.want_ride:
+                self.goal = random.uniform(cur[1], cur[2])
+            return
+        if self.want_ride or (abs(self.goal - self.x) > 400 * self.S and random.random() < 0.35):
+            if self.want_ride:                             # 叫牠去兜風：騎到比較遠的那一端
+                self.goal = lo if self.x - lo > hi - self.x else hi
+            self.riding, self.want_ride = True, False
+            return
+        if random.random() < 0.3:                          # 跳上某個視窗的上緣
+            options = [lg for lg in self.ledges() if 40 * self.S < self.y - lg[3] < 500 * self.S
+                       and lo <= lg[1] and lg[2] <= hi]
+            if options:
+                lg = random.choice(options)
+                gx = random.uniform(lg[1], lg[2])
+                if screen.edge_visible(lg[0], gx, lg[3]):
+                    self.goal, self.climb = gx, lg[0]
+
+    def jump_to(self, target):
+        """原地往上跳，剛好越過目標視窗上緣一點再落上去。"""
+        h = self.y - target[3] + 18 * self.S
+        self.left_ledge = self.ledge                       # 目標比腳下的視窗低時，落下要穿過原本站的那個
+        self.surface, self.ledge, self.vx, self.riding = None, None, 0.0, False
+        self.vy = -math.sqrt(2 * self.G * max(h, 10))
+
+    def chase(self, now, lo, hi):
+        """游標在附近晃的時候偶爾追過去，碰到就開心跳一下。追的時候回傳 True。"""
+        mx, my = self.cursor
+        if now < self.chase_until:
+            left, right = lo, hi
+            cur = self.find_ledge(self.ledge) if self.surface == 'perch' else None
+            if cur:                                        # 在視窗上就只在視窗上追，不會追到掉下去
+                left, right = cur[1], cur[2]
+            if abs(mx - self.x) < 14 * self.S and abs(my - (self.y - 4 * self.c)) < 120 * self.S:
+                self.chase_until, self.next_chase, self.goal = 0.0, now + 25, None
+                self.react_until, self.react_text = now + 1.5, '抓到了！'
+                self.hop(9)
+                return True
+            self.goal, self.riding, self.climb = min(max(mx, left), right), False, None
+            return True
+        if self.chase_until:                               # 時間到了還沒追到，放棄
+            self.chase_until, self.next_chase, self.goal = 0.0, now + 25, None
+        near = abs(mx - self.x) < 300 * self.S and -350 * self.S < my - self.y < 60 * self.S
+        moving = math.hypot(mx - self.last_cursor[0], my - self.last_cursor[1]) > 2 * self.S
+        if now > self.next_chase and near and moving and not self.riding and random.random() < 0.03:
+            self.chase_until = now + 6
+            return True
+        return False
+
+    def drop_height(self, floor):
+        """離正下方能落腳的地方（視窗上緣或地面）還有多高。"""
+        below = [lg[3] for lg in self.ledges() if lg[1] <= self.x <= lg[2] and lg[3] >= self.y
+                 and lg[0] != self.left_ledge and screen.edge_visible(lg[0], self.x, lg[3])]
+        return min(below + [floor]) - self.y
 
     def physics(self, now):
         if self.dragging:
             return
-        wa = work_area()
-        floor = wa[3]
-        perch = self.perch(now)
+        floor = screen.area_at(self.x, self.y - 1)[2][3]  # 腳下那個螢幕的地面
+        lo, hi = self.bounds()
         if self.surface == 'perch':
-            if not perch or not perch[0] <= self.x <= perch[1] or abs(self.y - perch[2]) > 60 * self.S:
-                self.surface, self.vy = None, 0.0          # 走出邊緣或視窗移開了：掉下去
+            cur = self.find_ledge(self.ledge)
+            if (not cur or not cur[1] <= self.x <= cur[2] or abs(self.y - cur[3]) > 60 * self.S
+                    or not screen.edge_visible(cur[0], self.x, cur[3])):
+                self.surface, self.vy, self.ledge = None, 0.0, None   # 走出邊緣、視窗移開或被蓋住了：掉下去
             else:
-                self.y = perch[2]                          # 跟著視窗移動
+                self.y = cur[3]                            # 跟著視窗移動
         elif self.surface == 'floor':
-            self.y = floor
-        lo, hi = wa[0] + 7 * self.c, wa[2] - 7 * self.c
+            if self.y < floor - 2:                         # 工作列收起來、走到比較矮的螢幕：掉下去
+                self.surface, self.vy = None, 0.0
+            else:
+                self.y = floor
         if self.surface is None:
             prev = self.y
-            self.vy = min(self.vy + self.G, 40 * self.S)
+            if self.chute:                                 # 降落傘：減速到慢慢飄下來，跟著傘左右擺
+                self.vy += (3 * self.S - self.vy) * 0.12
+                self.vx *= 0.94
+                self.x += 0.8 * self.S * math.sin(self.t / 9)
+            else:
+                self.vy = min(self.vy + self.G, 40 * self.S)
+                if self.vy > 0 and self.drop_height(floor) > 260 * self.S:   # 從高處往下掉才開傘
+                    self.chute = True
             self.y += self.vy
             self.x += self.vx
             self.vx *= 0.995                               # 一點空氣阻力，軌跡仍是拋物線
-            if not lo <= self.x <= hi:                     # 撞到螢幕邊緣就彈回來
+            if not lo <= self.x <= hi:                     # 撞到螢幕邊緣就彈回來，撞得太用力會頭暈
+                if abs(self.vx) > 14 * self.S:
+                    self.dizzy_until = now + 2.5
                 self.vx = -self.vx * 0.5
+            ceiling = screen.ceiling_at(self.x) + ROWS * self.c   # 頭頂碰到螢幕頂端就彈回來，一樣撞太用力會頭暈
+            if self.y < ceiling:
+                self.y = ceiling
+                if self.vy < 0:
+                    if self.vy < -14 * self.S:
+                        self.dizzy_until = now + 2.5
+                    self.vy = -self.vy * 0.4
             if self.vy > 0:
-                if perch and perch[0] <= self.x <= perch[1] and prev <= perch[2] <= self.y:
-                    self.land('perch', perch[2])
+                floor = screen.area_at(self.x, self.y - 1)[2][3]
+                ledge = self.landing(prev)
+                if ledge:
+                    self.land('perch', ledge[3], now, ledge[0])
                 elif self.y >= floor:
-                    self.land('floor', floor)
+                    self.land('floor', floor, now)
         else:
             self.rest_y = self.y
         self.x = min(max(self.x, lo), hi)
         self.land_sq *= 0.75
 
-    def land(self, surface, y):
+    def land(self, surface, y, now, ledge=None):
+        self.chute, self.left_ledge = False, None
         self.land_sq = min(0.25, 0.04 + abs(self.vy) / (60 * self.S))
+        if self.vy > 20 * self.S:                          # 被用力往下砸：頭暈
+            self.dizzy_until = now + 2.5
         if self.vy > 12 * self.S:                          # 摔得重就彈一下，順勢再滑一段
             self.y, self.vy, self.vx = y, -self.vy * 0.3, self.vx * 0.6
             return
-        self.surface, self.y, self.vx, self.vy = surface, y, 0.0, 0.0
+        self.surface, self.ledge, self.y, self.vx, self.vy = surface, ledge, y, 0.0, 0.0
+
+    def hide_in_corner(self):
+        """前景程式全螢幕時，縮小坐在那個螢幕的右下角，不擋畫面。"""
+        mon = screen.area_at(self.x, self.y - 1)[1]
+        cs = max(2, round(self.c / 2))
+        self.x, self.y = mon[2] - 7 * cs, mon[3]
+        self.surface, self.ledge, self.goal, self.climb = 'floor', None, None, None
+        self.vx = self.vy = 0.0
+        self.riding = self.chute = False
+        self.chase_until = 0.0
 
     # ───────── 繪製 ─────────
     def render(self, mode, now):
@@ -464,6 +616,11 @@ class Pet:
         if now > self.next_blink:
             self.blink_until, self.next_blink = now + 0.15, now + random.uniform(2.5, 6)
         blink = now < self.blink_until
+        if mode == 'idle' and not self.walking and self.surface is not None:   # 站著發呆時眼睛跟著游標
+            dx, dy = self.cursor[0] - self.x, self.cursor[1] - (self.y - 5 * self.c)
+            d = math.hypot(dx, dy)
+            if 0 < d < 700 * self.S:
+                lx, ly = 0.35 * dx / d, 0.35 * dy / d
 
         if mode == 'sleep':
             eyes, sq, bubble = 'sleep', sq + 0.03 * math.sin(t / 15), 'Z' + 'z' * (1 + (t // 20) % 3)
@@ -478,6 +635,8 @@ class Pet:
             arm_l, arm_r = ('high', 'high2') if (t // 6) % 2 else ('high2', 'high')
         elif mode == 'done':
             eyes, arm_l, arm_r, bubble = 'happy', 'up', 'up', '完成！'
+        if now < self.dizzy_until:
+            eyes, bubble, arm_l, arm_r = 'dizzy', None, 'nub', 'nub'
         if self.card:                                      # 卡片取代泡泡，Clawd 揮手引起注意
             eyes, bubble = 'big', None
             arm_l, arm_r = ('high', 'high2') if (t // 6) % 2 else ('high2', 'high')
@@ -489,11 +648,16 @@ class Pet:
             arm_l, arm_r = ('high', 'high2') if (t // 6) % 2 else ('high2', 'high')
         elif self.surface is None and self.vy > 14 * self.S:         # 從高處掉下來才驚嚇，原地小跳不算
             eyes, arm_l, arm_r = 'big', 'up', 'up'
+        if self.chute and not self.dragging:               # 雙手拉著降落傘的繩子
+            arm_l, arm_r, bubble = 'high', 'high', None
+            eyes = 'normal' if eyes == 'big' else eyes
         if now < self.react_until:
             eyes, bubble = 'happy', self.react_text
+        if self.hiding:                                    # 縮在全螢幕程式的角落：不講話，畫小一號
+            bubble = None
 
         typing = (mode == 'working' and not self.walking and self.surface is not None and not self.dragging
-                  and not self.card and now >= self.react_until)
+                  and not self.card and now >= self.react_until and now >= self.dizzy_until)
         if not typing:
             self.type_start = None
         elif self.type_start is None:
@@ -502,12 +666,25 @@ class Pet:
         cv = self.cv
         cv.delete('all')
         cx, by = self.W / 2, self.H - 1
-        if typing:
-            self.draw_typing(cx, by, now - self.type_start, t)
-        else:
-            self.draw_mascot(cx, by, eyes, lx, ly, arm_l, arm_r, run, sq)
-        if bubble:
-            self.draw_bubble(cx, by - 8 * self.c - 2 * self.S, bubble)
+        lift = 0                                           # 騎車時身體抬高，泡泡跟著往上
+        full_c = self.c
+        if self.hiding:
+            self.c = max(2, round(full_c / 2))
+        try:
+            if typing:
+                self.draw_typing(cx, by, now - self.type_start, t)
+            elif self.riding:
+                lift = self.draw_bike(cx, by, eyes, t)
+            else:
+                if self.chute and not self.dragging:
+                    self.draw_chute(cx, by, t)
+                self.draw_mascot(cx, by, eyes, lx, ly, arm_l, arm_r, run, sq)
+            if eyes == 'dizzy':
+                self.draw_stars(cx, by, t)
+            if bubble:
+                self.draw_bubble(cx, by - 8 * self.c - 2 * self.S - lift, bubble)
+        finally:
+            self.c = full_c
 
         # 跟視窗的實際位置比，不跟上次設定的值比：Tk 有時會把位置蓋回去（例如剛啟動就開卡片時停在 0,0）
         geo = (round(self.x - self.W / 2), round(self.y - self.H + 1))
@@ -520,7 +697,8 @@ class Pet:
             self.last_geo = geo
         if self.card:
             self.card.place_above(*self.card_anchor())
-        if t % (FPS // 2) == 0:                           # 別的視窗可能蓋過來，每半秒重申一次置頂（不搶焦點）
+        if now >= self.next_top:                           # 別的視窗可能蓋過來，每半秒重申一次置頂（不搶焦點）
+            self.next_top = now + 0.5
             keep_on_top(self.hwnd)
             for popup in (self.card, self.menu):          # 卡片與選單要在 Clawd 之上
                 if popup and not popup.closed:
@@ -561,6 +739,10 @@ class Pet:
                 self.rect(ex - 0.8 * s, ey + 1.3 * ch, s, s, INK)
                 self.rect(ex + cw / 2 - s / 2, ey + 1.3 * ch - s, s, s, INK)
                 self.rect(ex + cw - 0.2 * s, ey + 1.3 * ch, s, s, INK)
+            elif eyes == 'dizzy':                          # 叉叉眼
+                w = max(2, round(0.35 * c))
+                self.cv.create_line(ex - 0.2 * cw, ey + 0.2 * ch, ex + 1.2 * cw, ey + 1.6 * ch, fill=INK, width=w)
+                self.cv.create_line(ex - 0.2 * cw, ey + 1.6 * ch, ex + 1.2 * cw, ey + 0.2 * ch, fill=INK, width=w)
 
     def draw_typing(self, cx, by, phase, t):
         """敲筆電，仿 Claude 桌面版的動畫：拿出筆電放到面前地上、打開，轉成 3/4 側面用前手敲鍵盤。
@@ -583,17 +765,22 @@ class Pet:
                 pts += [cx + xs(col)[0], by + (row - ROWS) * c]
             self.cv.create_line(*pts, fill=color, width=max(2, round(0.45 * c)), capstyle='projecting')
 
-        near = 'arm_r' if mirror else 'arm_l'               # 靠筆電那一側的手
-        if phase < 0.25:                                   # 開場一：把闔著的筆電舉在頭旁邊
-            self.draw_mascot(cx, by, 'normal', 0, 0, **{'arm_l': 'nub', 'arm_r': 'nub', near: 'up'}, run=None, sq=0)
-            line([(-3.6, 0.6), (-0.6, 0.6)])
+        def arm(*steps):                                   # 從肩膀一格一格斜著接下去，相鄰兩格要重疊才不會斷
+            box(0, 3, 1, 1, CLAY)
+            for col, row, h in steps:
+                box(col, row, 1, h, CLAY)
+
+        if phase < 0.25:                                   # 開場一：前手往外伸再往上彎，闔著的筆電平放在手上
+            self.draw_mascot(cx, by, 'normal', 0, 0, 'nub', 'nub', None, 0)
+            arm((-1, 1, 3))
+            line([(-3.4, 0.78), (0.2, 0.78)])
             return
-        if phase < 0.45:                                   # 開場二：放到地上
-            self.draw_mascot(cx, by, 'normal', 0, 0.3, **{'arm_l': 'nub', 'arm_r': 'nub', near: 'out'}, run=None,
-                             sq=0.04)
-            line([(-3.6, 6.8), (-0.6, 6.8)])
+        if phase < 0.45:                                   # 開場二：手肘彎下去，把筆電放到地上
+            self.draw_mascot(cx, by, 'normal', 0, 0.3, 'nub', 'nub', None, 0)
+            arm((-0.6, 3.6, 1), (-1.1, 4.3, 1), (-1.4, 5.1, 1.5))
+            line([(-3.6, 6.8), (-0.4, 6.8)])
             return
-        line([(-5.4, 4.2), (-3.6, 6.8), (-0.4, 6.8)])      # 打開的筆電：往後仰的螢幕＋平放的鍵盤
+        line([(-4.4, 4.2), (-2.6, 6.8), (0.8, 6.8)])      # 打開的筆電擺在腳前：往後仰的螢幕＋平放的鍵盤
         box(1, 0, 8, 5, CLAY)                              # 正面
         box(9, 0, 2, 5, SIDE)                              # 側面
         for col, color in ((2, CLAY), (4.5, CLAY), (7.5, CLAY), (9.5, SIDE)):
@@ -601,11 +788,83 @@ class Pet:
             box(col - 0.4, 6.4, 0.5, 0.6, color)           # 腳尖朝前
         box(1, 1.2, 1, 1.6, INK)                           # 眼睛偏向前方
         box(5, 1.2, 1, 1.6, INK)
-        box(0, 3, 1, 1, CLAY)                              # 前手：伸出去／壓到鍵盤上，節奏刻意不規律
-        if (0b1011010011010110 >> (t // 3 % 16)) & 1:
-            box(-1.2, 5.5, 1, 1, CLAY)
+        if (0b1011010011010110 >> (t // 3 % 16)) & 1:      # 前手敲鍵盤，節奏刻意不規律
+            arm((-0.6, 3.6, 1), (-1.1, 4.3, 1), (-1.4, 5.1, 1.5))     # 手肘往下，手掌壓在鍵盤上
         else:
-            box(-1, 3, 1, 1, CLAY)
+            arm((-0.7, 2.7, 1), (-1.3, 3.3, 1), (-1.6, 4.1, 1.1))     # 手肘抬起，手掌離開鍵盤
+
+    def draw_bike(self, cx, by, eyes, t):
+        """側身騎腳踏車：3/4 側面的身體坐在座墊上，前手彎著握把手，兩腳跟著踏板一上一下。回傳身體抬高的量。"""
+        c, f = self.c, self.facing
+        R, lift = 2.2 * c, 3.2 * c
+        w = max(2, round(0.45 * c))
+
+        def P(dx, dy):                                     # 以格為單位：dx 往前為正、dy 往上為正
+            return cx + f * dx * c, by - dy * c
+
+        def B(dx0, dx1, dy0, dy1, color):                  # 前後 dx0–dx1、上下 dy0–dy1 的方塊
+            (x0, y0), (x1, y1) = P(dx0, dy0), P(dx1, dy1)
+            self.rect(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0), color)
+
+        def leg(pedal, color):
+            px, py = pedal
+            B(px - 0.5, px + 0.5, py, 5.4, color)           # 從屁股往下踩到踏板
+            B(px + 0.5, px + 0.9, py, py + 0.5, color)      # 腳尖朝前
+
+        a = t * 0.35                                       # 踏板與輪子的角度，往前騎是順著行進方向轉
+        crank = (0, 2.6)
+        pedals = [(crank[0] + 0.9 * math.cos(-a + k * math.pi), crank[1] + 0.9 * math.sin(-a + k * math.pi))
+                  for k in (0, 1)]
+        leg(pedals[1], SIDE)                               # 另一邊的腳在車架後面
+        for hub in (-4.4, 4.4):                            # 輪子＋轉動的輻條
+            hx, hy = P(hub, 2.2)
+            self.cv.create_oval(hx - R, hy - R, hx + R, hy + R, outline=TIRE, width=w)
+            for k in range(2):
+                ang = -a + k * math.pi / 2
+                dx, dy = 1.76 * math.cos(ang), 1.76 * math.sin(ang)
+                self.cv.create_line(*P(hub - dx, 2.2 - dy), *P(hub + dx, 2.2 + dy), fill=LAPTOP, width=max(1, w // 2))
+        rear, mid, seat = P(-4.4, 2.2), P(*crank), P(-1.4, 5.0)
+        head, front, grip = P(3.0, 5.0), P(4.4, 2.2), P(4.9, 5.6)
+        for p0, p1 in ((rear, mid), (rear, seat), (seat, mid), (seat, head), (mid, head), (head, front), (head, grip)):
+            self.cv.create_line(*p0, *p1, fill=BIKE, width=w, capstyle='round')
+        self.cv.create_line(*P(4.4, 5.6), *P(5.8, 5.6), fill=INK, width=w, capstyle='round')   # 把手
+        B(-2.4, -0.4, 5.0, 5.4, INK)                       # 座墊
+        B(-4.5, 3.5, 5.2, 10.2, CLAY)                      # 正面朝前
+        B(-6.5, -4.5, 5.2, 10.2, SIDE)                     # 側面
+        for ex in (2.5, -1.5):                             # 眼睛偏向前方
+            if eyes == 'blink':
+                B(ex, ex + 1, 8.0, 8.4, INK)
+            else:
+                B(ex, ex + 1, 7.4, 9.0, INK)
+        self.cv.create_line(*P(*pedals[0]), *P(*pedals[1]), fill=INK, width=w)   # 曲柄
+        leg(pedals[0], CLAY)                               # 這一邊的腳在最前面
+        B(3.5, 4.3, 6.2, 7.2, CLAY)                        # 前手：從肩膀往前下彎到把手
+        B(4.0, 5.0, 5.7, 6.7, CLAY)
+        B(4.5, 5.5, 5.2, 6.2, CLAY)
+        return lift
+
+    def draw_chute(self, cx, by, t):
+        """降落傘：奶油色與陶土色相間的傘面，四條繩子拉到兩隻高舉的手。"""
+        c, S = self.c, self.S
+        x0 = cx + 0.5 * c * math.sin(t / 9)                # 傘面比身體多晃一點
+        hw, base, h = 7 * c, by - 10.2 * c, 3.8 * c
+        lw = max(1, round(S))
+        hands = (cx - 6.5 * c, by - 8 * c), (cx + 6.5 * c, by - 8 * c)
+        for ex, hand in ((-1, hands[0]), (-0.35, hands[0]), (0.35, hands[1]), (1, hands[1])):
+            self.cv.create_line(x0 + ex * hw, base, *hand, fill=LAPTOP, width=lw)
+        for i in range(6):
+            self.cv.create_arc(x0 - hw, base - h, x0 + hw, base + h, start=i * 30, extent=30,
+                               fill=CREAM if i % 2 else CLAY, outline=INK, width=lw)
+
+    def draw_stars(self, cx, by, t):
+        """頭暈時在頭上繞圈的星星。"""
+        c = self.c
+        for k in range(3):
+            a = t / 6 + k * 2 * math.pi / 3
+            x, y, r = cx + 4.5 * c * math.cos(a), by - 7.6 * c + 0.9 * c * math.sin(a), 0.7 * c
+            q = 0.3 * r
+            self.cv.create_polygon(x, y - r, x + q, y - q, x + r, y, x + q, y + q, x, y + r, x - q, y + q, x - r, y,
+                                   x - q, y - q, fill=STAR, outline='')
 
     def draw_bubble(self, cx, bottom, text):
         S = self.S
@@ -621,17 +880,30 @@ class Pet:
 
     # ───────── 主迴圈 ─────────
     def tick(self):
+        slow = False
         try:
             now = time.time()
             self.poll_state(now)
             self.poll_requests(now)
-            mode = self.mode(now)
-            self.think(mode, now)
-            self.physics(now)
+            mode = self.cur_mode = self.mode(now)
+            self.cursor = screen.cursor()
+            hmon = screen.area_at(self.x, self.y - 1)[0]
+            menu_open = self.menu is not None and not self.menu.closed
+            self.hiding = (screen.fullscreen_monitor() == hmon and not ipc.claude_is_foreground()   # Claude 自己全螢幕不算
+                           and not self.card and not self.drag and not menu_open)
+            if self.hiding:
+                self.hide_in_corner()
+            else:
+                self.think(mode, now)
+                self.physics(now)
             self.render(mode, now)
-            self.t += 1
+            self.last_cursor = self.cursor
+            # 睡覺或縮在角落時沒什麼在動：每秒只畫 10 次省電，動畫時間照樣往前推
+            slow = ((mode == 'sleep' or self.hiding) and self.surface is not None and not self.drag
+                    and not self.card and not menu_open)
+            self.t += 3 if slow else 1
         finally:
-            self.root.after(1000 // FPS, self.tick)
+            self.root.after(100 if slow else 1000 // FPS, self.tick)
 
     def run(self):
         self.tick()
