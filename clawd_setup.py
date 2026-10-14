@@ -1,11 +1,12 @@
-"""把 Clawd 的 hook 加進／移出 Claude Code 的使用者設定（~/.claude/settings.json）。
+"""把 Clawd 的 hook 加進／移出 Claude Code 的使用者設定（~/.claude/settings.json），也管開機自動啟動（登錄檔）。
 
 hook 的指令是「開著 Clawd 的那個 Python 的 pythonw.exe」加上參數 [Clawd.pyw 的路徑, "hook"]。
-只動自己加的項目（參數指向 Clawd.pyw 或舊版的 clawd_hook.py），其他設定與別人的 hook 原封不動。
+只動自己加的項目（參數的檔名是 Clawd.pyw 或舊版的 clawd_hook.py），其他設定與別人的 hook 原封不動。
 """
 import json
 import os
 import sys
+import winreg
 from pathlib import Path
 
 SETTINGS = Path.home() / '.claude' / 'settings.json'
@@ -16,11 +17,14 @@ EVENTS = {
     'UserPromptSubmit': (None, 10),
     'PreToolUse': ('*', 600),
     'PostToolUse': ('*', 10),
+    'PostToolUseFailure': ('*', 10),
     'PermissionRequest': ('*', 600),
     'Notification': (None, 10),
     'Stop': (None, 10),
     'SessionEnd': (None, 5),
 }
+RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'   # 開機自動啟動的登錄位置
+RUN_NAME = 'Clawd'
 
 
 def launcher():
@@ -32,13 +36,16 @@ def launcher():
 
 def _is_ours(hook):
     args = hook.get('args') if isinstance(hook.get('args'), list) else []
-    return any(str(a).lower().endswith(('clawd.pyw', 'clawd_hook.py')) for a in args)
+    return any(os.path.basename(str(a)).lower() in ('clawd.pyw', 'clawd_hook.py') for a in args)
 
 
 def _load():
     if not SETTINGS.exists():
         return {}
-    data = json.loads(SETTINGS.read_text(encoding='utf-8'))   # 格式壞掉就丟例外，不去覆寫使用者的檔案
+    text = SETTINGS.read_text(encoding='utf-8-sig')      # 可能帶 BOM；寫回時不加
+    if not text.strip():
+        return {}
+    data = json.loads(text)                              # 格式壞掉就丟例外，不去覆寫使用者的檔案
     if not isinstance(data, dict):
         raise ValueError('settings.json 的最外層不是物件')
     return data
@@ -76,20 +83,20 @@ def _strip(data):
 
 
 def status():
-    """'on'：已連動到目前這份 Clawd；'moved'：連動的是別的位置或別的 Python；'off'：沒連動。"""
+    """'on'：已連動到目前這份 Clawd；'moved'：連動的是別的位置或別的 Python，或缺了某些事件（舊版裝的）；'off'：沒連動。"""
     try:
         data = _load()
     except (OSError, ValueError):
         return 'off'
-    found = [h for groups in (data.get('hooks') or {}).values() if isinstance(groups, list)
+    found = [(event, h) for event, groups in (data.get('hooks') or {}).items() if isinstance(groups, list)
              for g in groups if isinstance(g, dict) for h in g.get('hooks', []) if isinstance(h, dict) and _is_ours(h)]
     if not found:
         return 'off'
     py, entry = launcher()
     same = lambda a, b: os.path.normcase(str(a)) == os.path.normcase(str(b))
     ok = all(same(h.get('command'), py) and len(h['args']) == 2 and same(h['args'][0], entry) and h['args'][1] == 'hook'
-             for h in found)
-    return 'on' if ok else 'moved'
+             for _, h in found)
+    return 'on' if ok and {event for event, _ in found} == set(EVENTS) else 'moved'
 
 
 def install():
@@ -109,3 +116,30 @@ def uninstall():
     data = _load()
     if _strip(data):
         _save(data)
+
+
+def _run_command():
+    py, entry = launcher()
+    return '"%s" "%s"' % (py, entry)
+
+
+def autostart_status():
+    """'on'：開機自動啟動已設成目前這份 Clawd；'moved'：值還在但內容不同（例如搬了資料夾）；'off'：沒設定。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, RUN_NAME)
+    except OSError:
+        return 'off'
+    return 'on' if value == _run_command() else 'moved'
+
+
+def set_autostart(on):
+    """on 為 True 就寫入啟動指令，False 就刪掉（本來就沒有也不算錯）。"""
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if on:
+            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, _run_command())
+            return
+        try:
+            winreg.DeleteValue(key, RUN_NAME)
+        except FileNotFoundError:
+            pass

@@ -36,10 +36,12 @@ def theme():
     if dark:
         return dict(bg='#2C2C2C', border='#454545', hover='#383838', text='#FFFFFF', sub='#C8C8C8',
                     sep='#3D3D3D', control='#373737', control_hover='#3F3F3F', control_border='#434343',
-                    code='#1F1F1F', accent=accent or '#4CC2FF', on_accent='#000000')
+                    code='#1F1F1F', accent=accent or '#4CC2FF', on_accent='#000000',
+                    **{'del': '#FF99A4', 'add': '#6CCB5F'})
     return dict(bg='#F9F9F9', border='#DADADA', hover='#EAEAEA', text='#1B1B1B', sub='#5D5D5D',
                 sep='#E5E5E5', control='#FFFFFF', control_hover='#F6F6F6', control_border='#E0E0E0',
-                code='#EFEFEF', accent=accent or '#005FB8', on_accent='#FFFFFF')
+                code='#EFEFEF', accent=accent or '#005FB8', on_accent='#FFFFFF',
+                **{'del': '#C42B1C', 'add': '#0F7B0F'})
 
 
 def colorref(hex_color):
@@ -209,7 +211,7 @@ class FluentMenu(Popup):
 class RequestCard(Popup):
     """Clawd 頭上的互動卡片：回覆權限請求，或回答 Claude 的提問。
 
-    on_answer(dict) 收到 {'decision': 'allow'|'deny'|'release'} 或 {'answers': {問題: 答案}}。
+    on_answer(dict) 收到 {'decision': 'allow'|'deny'|'release'|'always'} 或 {'answers': {問題: 答案}}。
     """
 
     def __init__(self, root, scale, request, on_answer, anchor):
@@ -217,6 +219,7 @@ class RequestCard(Popup):
         self.req, self.on_answer = request, on_answer
         self.answers = {}
         self.qi = 0
+        self.history = []                               # 每題答過的 index，給「上一題」用
         self.picked = set()
         self.anchor = anchor                            # (中心 x, 底邊 y)
         self.render()
@@ -228,20 +231,13 @@ class RequestCard(Popup):
 
     # ───────── 版面 ─────────
     def render(self):
-        S, t, cv = self.S, self.t, self.cv
-        cv.delete('all')
-        self.buttons, self.hovered = [], None
-        self.W = W = round(360 * S)
-        pad = 16 * S
-        inner = W - 2 * pad
-        y = pad
-        if self.req.get('kind') == 'question':
-            y = self._render_question(pad, y, inner)
-        elif self.req.get('kind') == 'confirm':
-            y = self._render_confirm(pad, y, inner)
-        else:
-            y = self._render_permission(pad, y, inner)
-        h = y + pad
+        W, cv = round(360 * self.S), self.cv
+        self.W, self.compact = W, False
+        h = self._layout()
+        wa = work_area(*(self.anchor or (0, 0)))
+        if h > (wa[3] - wa[1]) * 0.85:                  # 超過工作區八成五：summary 與 diff 縮短後重排一次
+            self.compact = True
+            h = self._layout()
         if not hasattr(self, 'w'):
             cx, bottom = self.anchor or (0, 0)
             self.show(W, h, cx - W / 2, bottom - h)
@@ -251,8 +247,26 @@ class RequestCard(Popup):
             if self.anchor:
                 self.place_above(*self.anchor)
 
+    def _layout(self):
+        """依目前狀態從頭畫一次，回傳內容總高度。"""
+        cv = self.cv
+        cv.delete('all')
+        self.buttons, self.hovered = [], None
+        pad = 16 * self.S
+        inner = self.W - 2 * pad
+        y = pad
+        if self.req.get('kind') == 'question':
+            y = self._render_question(pad, y, inner)
+        elif self.req.get('kind') == 'confirm':
+            y = self._render_confirm(pad, y, inner)
+        else:
+            y = self._render_permission(pad, y, inner)
+        return y + pad
+
     def _title(self, x, y, text, right=''):
         S, t = self.S, self.t
+        gap = 8 * S + self.f_small.measure(right) if right else 0       # 右側文字與它前面的間距
+        text = self._fit(text, self.f_bold, self.W - 50 * S - gap)      # 標題依剩餘寬度截斷（內容寬 W-32S，扣掉縮排 18S）
         round_rect(self.cv, x, y + 5 * S, x + 10 * S, y + 15 * S, 2 * S, fill='#D97757', outline='')
         self.cv.create_text(x + 18 * S, y + 10 * S, text=text, font=self.f_bold, fill=t['text'], anchor='w')
         if right:
@@ -263,33 +277,85 @@ class RequestCard(Popup):
         item = self.cv.create_text(x, y, text=text, font=font, fill=color, anchor='nw', width=width)
         return self.cv.bbox(item)[3]
 
-    def _link(self, x, y, text, action):
+    def _fit(self, text, font, maxw):
+        """寬度超過 maxw 就從尾端截掉，加上 '…'。"""
+        if font.measure(text) <= maxw:
+            return text
+        while text and font.measure(text + '…') > maxw:
+            text = text[:-1]
+        return text + '…'
+
+    def _height(self, text, font, width):
+        """量文字換行後的實際高度；量完立刻刪掉，不會留在畫面上。"""
+        if not text:
+            return 0
+        item = self.cv.create_text(0, 0, text=text, font=font, anchor='nw', width=width)
+        box = self.cv.bbox(item)
+        self.cv.delete(item)
+        return box[3] - box[1]
+
+    def _right_text(self, project, tail=''):
+        """標題列右側：專案名稱（最多占內容寬四成，超過截斷）後面接 tail，例如 '1 / 3'。"""
+        if not project:
+            return tail
+        sep = ' · ' if tail else ''
+        room = (self.W - 32 * self.S) * 0.4 - self.f_small.measure(sep + tail)
+        return self._fit(project, self.f_small, room) + sep + tail
+
+    def _link(self, x, y, text, action, arrow=True):
         S, t = self.S, self.t
         tw = self.f_small.measure(text + '  ')
         self.add_button(x - 6 * S, y - 3 * S, x + tw + 14 * S, y + 21 * S, action, t['bg'], t['hover'])
         self.cv.create_text(x, y + 9 * S, text=text, font=self.f_small, fill=t['sub'], anchor='w')
-        self.cv.create_text(x + tw, y + 9 * S, text='', font=self.f_icon_small, fill=t['sub'], anchor='w')
+        if arrow:
+            self.cv.create_text(x + tw, y + 9 * S, text='', font=self.f_icon_small, fill=t['sub'], anchor='w')
         return y + 22 * S
 
     def _render_permission(self, x, y, w):
         S, t, cv = self.S, self.t, self.cv
-        y = self._title(x, y, 'Claude 想使用 %s' % self.req.get('tool', '工具'))
+        diff = self.req.get('diff') or []
+        y = self._title(x, y, 'Claude 想使用 %s' % self.req.get('tool', '工具'),
+                        self._right_text(self.req.get('project') or ''))
         y = self._text(x, y + 2 * S, '要允許這個操作嗎？', self.f_small, t['sub'], w) + 10 * S
         summary = self.req.get('summary', '').strip()
         if summary:
             lines = summary.splitlines()
-            shown = '\n'.join(lines[:8])[:600]
-            if len(lines) > 8 or len(summary) > len(shown):
+            n = 4 if self.compact else 8
+            shown = '\n'.join(lines[:n])[:600]
+            if len(lines) > n or len(summary) > len(shown):
                 shown += '\n…'
             box = round_rect(cv, x, y, x + w, y + 10, 4 * S, fill=t['code'], outline='')
             bottom = self._text(x + 10 * S, y + 8 * S, shown, self.f_mono, t['text'], w - 20 * S) + 8 * S
             cv.coords(box, *self._rr_points(x, y, x + w, bottom, 4 * S))
-            y = bottom + 14 * S
+            y = bottom + (8 if diff else 14) * S
+        if diff:
+            y = self._diff(x, y, w, diff) + 14 * S
         bw = (w - 8 * S) / 2
         self._button(x, y, x + bw, y + 32 * S, '允許', lambda: self.on_answer({'decision': 'allow'}), accent=True)
         self._button(x + bw + 8 * S, y, x + w, y + 32 * S, '拒絕', lambda: self.on_answer({'decision': 'deny'}))
         y += 32 * S + 12 * S
+        if self.req.get('suggestions'):                 # 有建議規則才給「總是允許」，滿寬、非強調色
+            label = self._fit('總是允許：' + (self.req.get('suggest_label') or ''), self.f_body, w - 24 * S)
+            self._button(x, y, x + w, y + 32 * S, label, lambda: self.on_answer({'decision': 'always'}))
+            y += 32 * S + 12 * S
         return self._link(x, y, '在 Claude 中處理', lambda: self.on_answer({'decision': 'release'}))
+
+    def _diff(self, x, y, w, diff):
+        """Edit／Write 的差異預覽：- 紅、+ 綠。最多 12 行（壓縮時 6 行），超過時末行標示還有幾行。"""
+        S, t, cv = self.S, self.t, self.cv
+        limit = 6 if self.compact else 12
+        rows = diff[:limit - 1] if len(diff) > limit else diff
+        box = round_rect(cv, x, y, x + w, y + 10, 4 * S, fill=t['code'], outline='')
+        bottom = y + 8 * S
+        for line in rows:
+            color = t['del'] if line.startswith('-') else t['add'] if line.startswith('+') else t['text']
+            bottom = self._text(x + 10 * S, bottom, line or ' ', self.f_mono, color, w - 20 * S)
+        if len(diff) > limit:
+            bottom = self._text(x + 10 * S, bottom, '… 還有 %d 行' % (len(diff) - len(rows)), self.f_small,
+                                t['sub'], w - 20 * S)
+        bottom += 8 * S
+        cv.coords(box, *self._rr_points(x, y, x + w, bottom, 4 * S))
+        return bottom
 
     def _render_confirm(self, x, y, w):
         """一般的是／否詢問：req 帶 title、body、yes、no。"""
@@ -308,7 +374,8 @@ class RequestCard(Popup):
         qs = self.req.get('questions') or []
         q = qs[self.qi]
         multi = bool(q.get('multiSelect'))
-        right = '%d / %d' % (self.qi + 1, len(qs)) if len(qs) > 1 else ''
+        tail = '%d / %d' % (self.qi + 1, len(qs)) if len(qs) > 1 else ''
+        right = self._right_text(self.req.get('project') or '', tail)
         y = self._title(x, y, q.get('header') or 'Claude 想問你', right)
         y = self._text(x, y + 2 * S, q.get('question', ''), self.f_body, t['text'], w) + 12 * S
         for i, opt in enumerate(q.get('options') or []):
@@ -316,26 +383,28 @@ class RequestCard(Popup):
             on = i in self.picked
             tx = x + (36 * S if multi else 12 * S)
             # 先量高度再畫底，底色要在文字下面
-            probe = cv.create_text(tx, 0, text=desc, font=self.f_small, anchor='nw', width=w - (tx - x) - 12 * S)
-            desc_h = (cv.bbox(probe)[3] - cv.bbox(probe)[1]) if desc else 0
-            cv.delete(probe)
-            h = 14 * S + self.f_body.metrics('linespace') + (desc_h + 2 * S if desc else 0)
+            lw = w - (tx - x) - 12 * S                  # 選項文字可用寬度，超過就換行
+            label_h = self._height(label, self.f_body, lw)
+            desc_h = self._height(desc, self.f_small, lw)
+            h = 14 * S + label_h + (desc_h + 2 * S if desc else 0)
             self.add_button(x, y, x + w, y + h, self._pick(i, multi), t['control'], t['control_hover'],
                             outline=t['accent'] if on else t['control_border'])
             if multi:
                 cv.create_text(x + 18 * S, y + h / 2, text='' if on else '', font=self.f_icon,
                                fill=t['accent'] if on else t['sub'])
             ly = y + 7 * S
-            cv.create_text(tx, ly, text=label, font=self.f_body, fill=t['text'], anchor='nw')
+            cv.create_text(tx, ly, text=label, font=self.f_body, fill=t['text'], anchor='nw', width=lw)
             if desc:
-                self._text(tx, ly + self.f_body.metrics('linespace') + 2 * S, desc, self.f_small, t['sub'],
-                           w - (tx - x) - 12 * S)
+                self._text(tx, ly + label_h + 2 * S, desc, self.f_small, t['sub'], lw)
             y += h + 6 * S
         if multi:
             y += 4 * S
-            self._button(x, y, x + w, y + 32 * S, '送出', self._submit_multi, accent=True)
+            self._button(x, y, x + w, y + 32 * S, '送出', self._submit_multi, accent=True,
+                         enabled=bool(self.picked))
             y += 32 * S
         y += 12 * S
+        if self.qi > 0:                                 # 「上一題」靠右，與下方連結同一列
+            self._link(x + w - self.f_small.measure('上一題  ') - 14 * S, y, '上一題', self._back, arrow=False)
         return self._link(x, y, '其他答案：在 Claude 中回答', lambda: self.on_answer({'decision': 'release'}))
 
     def _rr_points(self, x0, y0, x1, y1, r):
@@ -343,9 +412,12 @@ class RequestCard(Popup):
                 x1, y1 - r, x1, y1, x1 - r, y1, x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1, x0, y1 - r,
                 x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
 
-    def _button(self, x0, y0, x1, y1, label, action, accent=False):
+    def _button(self, x0, y0, x1, y1, label, action, accent=False, enabled=True):
         t = self.t
-        if accent:
+        if not enabled:                                 # 停用：只畫不登記，沒有 hover、手形游標，點了也沒反應
+            round_rect(self.cv, x0, y0, x1, y1, 4 * self.S, fill=t['control'], outline=t['control_border'])
+            color = t['sub']
+        elif accent:
             self.add_button(x0, y0, x1, y1, action, t['accent'], t['accent'])
             color = t['on_accent']
         else:
@@ -367,10 +439,20 @@ class RequestCard(Popup):
         if self.picked:
             self._answer(sorted(self.picked))
 
+    def _back(self):
+        """回上一題：撤掉那題的答案；多選時 picked 還原成當時選的項目。"""
+        self.qi -= 1
+        picked = self.history.pop()
+        q = self.req['questions'][self.qi]
+        self.answers.pop(q.get('question', ''), None)
+        self.picked = set(picked) if q.get('multiSelect') else set()
+        self.render()
+
     def _answer(self, indexes):
         q = self.req['questions'][self.qi]
         labels = [q['options'][i].get('label', '') for i in indexes]
         self.answers[q.get('question', '')] = ', '.join(labels)
+        self.history.append(list(indexes))
         self.qi += 1
         self.picked = set()
         if self.qi >= len(self.req['questions']):

@@ -2,16 +2,18 @@
 
 請求／回應流程：hook 把請求寫進 requests/<id>.json，桌寵顯示卡片，
 使用者按下後桌寵寫 responses/<id>.json，hook 讀到就回覆給 Claude Code 並刪掉兩個檔。
+狀態：hook 每個 Claude Code 對話寫一個 sessions/<session>.json（見 session_path），對話結束時刪掉。
 """
 import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 BASE = Path.home() / '.clawd'
-STATE_FILE = BASE / 'state.json'
+SESS_DIR = BASE / 'sessions'
 REQ_DIR = BASE / 'requests'
 RESP_DIR = BASE / 'responses'
 MUTEX_NAME = 'Local\\ClawdDesktopPet'
@@ -95,6 +97,12 @@ def pid_alive(pid):
     return code.value == 259                                       # STILL_ACTIVE
 
 
+def session_path(sid):
+    """這個 session 的狀態檔：檔名只留英數、底線與連字號，最多 64 字，空的用 default。"""
+    name = re.sub(r'[^A-Za-z0-9_-]', '', str(sid or ''))[:64] or 'default'
+    return SESS_DIR / (name + '.json')
+
+
 def write_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name('%s.%d.tmp' % (path.name, os.getpid()))
@@ -102,10 +110,11 @@ def write_json(path, obj):
     for _ in range(5):                                  # 對方剛好在讀檔時 replace 會失敗，稍等重試
         try:
             os.replace(tmp, path)
-            return
+            return True
         except PermissionError:
             time.sleep(0.02)
     tmp.unlink(missing_ok=True)
+    return False
 
 
 def read_json(path):

@@ -15,6 +15,14 @@ user32.WindowFromPoint.restype = wt.HWND
 user32.WindowFromPoint.argtypes = [wt.POINT]
 user32.GetAncestor.restype = wt.HWND
 user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetWindow.restype = wt.HWND
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+for _f in (user32.IsWindowVisible, user32.IsIconic, user32.GetWindowTextLengthW):   # 宣告成 HWND：64 位元的值才不會被擋
+    _f.argtypes = [wt.HWND]
+user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 MONITORENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(wt.RECT), wt.LPARAM)
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 SHELL_CLASSES = ('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')
@@ -141,26 +149,42 @@ def ceiling_at(x):
 
 
 # ───────── 可以站的視窗上緣 ─────────
+def _own(hwnd):
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value == os.getpid()
+
+
+def _cloaked(hwnd):
+    cloaked = ctypes.c_int(0)
+    dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)   # DWMWA_CLOAKED：其他虛擬桌面等
+    return bool(cloaked.value)
+
+
+def ledge_of(hwnd, min_width, headroom):
+    """這個視窗現在的上緣 (hwnd, 左, 右, 上緣 y)；縮小、隱藏、太窄或上面站不下（最大化）時回傳 None。"""
+    if not hwnd or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return None
+    left, top, right, bottom = window_rect(hwnd)
+    area = area_at((left + right) / 2, top)[2]
+    if right - left >= min_width and top - headroom >= area[1] and top < area[3]:
+        return hwnd, left, right, top
+    return None
+
+
 def _ledges(min_width, headroom):
-    pid, found = os.getpid(), []
-    own = wt.DWORD()
+    found = []
 
     def cb(hwnd, _):
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or not user32.GetWindowTextLengthW(hwnd):
+        if not user32.IsWindowVisible(hwnd) or not user32.GetWindowTextLengthW(hwnd):
             return True
         if user32.GetWindowLongW(hwnd, -20) & 0x80:          # WS_EX_TOOLWINDOW：浮動工具列、通知之類
             return True
-        cloaked = ctypes.c_int(0)
-        dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)   # DWMWA_CLOAKED：其他虛擬桌面等
-        if cloaked.value:
+        if _cloaked(hwnd) or _own(hwnd) or _class_name(hwnd) in SHELL_CLASSES:
             return True
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(own))
-        if own.value == pid or _class_name(hwnd) in SHELL_CLASSES:
-            return True
-        left, top, right, bottom = window_rect(hwnd)
-        area = area_at((left + right) / 2, top)[2]
-        if right - left >= min_width and top - headroom >= area[1] and top < area[3]:   # 最大化的視窗上面站不下
-            found.append((hwnd, left, right, top))
+        lg = ledge_of(hwnd, min_width, headroom)
+        if lg:
+            found.append(lg)
         return True
 
     user32.EnumWindows(WNDENUMPROC(cb), 0)
@@ -173,9 +197,22 @@ def ledges(min_width, headroom):
 
 
 def edge_visible(hwnd, x, top):
-    """視窗上緣在 x 這一點沒有被別的視窗蓋住。"""
-    h = user32.WindowFromPoint(wt.POINT(int(x), int(top) + 3))
-    return bool(h) and user32.GetAncestor(h, 2) == hwnd     # GA_ROOT
+    """視窗上緣在 x 這一點沒有被別的視窗蓋住（Clawd 自己的視窗、卡片、選單不算）。"""
+    px, py = int(x), int(top) + 3
+    h = user32.WindowFromPoint(wt.POINT(px, py))
+    root = user32.GetAncestor(h, 2) if h else None          # GA_ROOT
+    if root and not _own(root):
+        return root == hwnd
+    # 探測點剛好落在 Clawd 自己身上（例如快速落下時身體已經蓋過上緣）：改沿 z-order 往上找別人的視窗
+    h = user32.GetWindow(hwnd, 3)                            # GW_HWNDPREV
+    while h:
+        if (user32.IsWindowVisible(h) and not user32.IsIconic(h) and not _own(h) and not _cloaked(h)
+                and not user32.GetWindowLongW(h, -20) & 0x20):   # WS_EX_TRANSPARENT：點擊穿透的疊加層
+            left, t, right, bottom = window_rect(h)
+            if left <= px < right and t <= py < bottom:
+                return False
+        h = user32.GetWindow(h, 3)
+    return True
 
 
 def cursor():
