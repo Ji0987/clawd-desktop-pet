@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 從別的目錄啟動也找得到旁邊的模組
 
-__version__ = '1.2.0'
+__version__ = '1.2.1'
 
 
 def message(text, icon=0x40):

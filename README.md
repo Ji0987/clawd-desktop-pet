@@ -9,7 +9,7 @@
 ## 安裝
 
 1. 安裝 [Python](https://www.python.org/downloads/windows/) 3.10 以上（預設選項即可，要包含 tcl/tk）
-2. 下載 `Clawd-v1.2.0.zip` 並解壓縮，會得到一個 `Clawd` 資料夾；把它放到固定的位置，例如 `文件\Clawd`
+2. 下載 `Clawd-v1.2.1.zip` 並解壓縮，會得到一個 `Clawd` 資料夾；把它放到固定的位置，例如 `文件\Clawd`
 3. 雙擊資料夾裡的 `Clawd.pyw`
 4. 第一次執行時，Clawd 頭上會問「要跟 Claude Code 連動嗎？」，按「連動」
 
